@@ -9,7 +9,8 @@
     "backend": {
       "root": "backend",
       "framework": "fastapi",
-      "routePrefix": "/api"
+      "routePrefix": "/api",
+      "wsgiFile": "server.py"
     }
   }
 }
