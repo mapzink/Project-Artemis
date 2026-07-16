@@ -27,6 +27,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -54,6 +55,7 @@ class CascadeFailureReason(str, Enum):
     CHUNK_TAMPERED = "chunk_tampered"
     ROLE_DENIED = "role_denied"
     INSUFFICIENT_SAMPLES = "insufficient_samples"
+    OUTSIDE_PERIMETER = "outside_perimeter"
 
 
 @dataclass(frozen=True)
@@ -124,8 +126,96 @@ def _simulated_decapsulate(
 
 
 # ---------------------------------------------------------------------------
+# Spatial boundary and nonce management
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SpatialBoundary:
+    """
+    Server-side secure-zone perimeter definition.
+
+    Coordinates use the same normalised 0-100 grid as position samples.
+    This definition is kept STRICTLY server-side — exposing it to clients
+    allows an attacker to craft coordinates that sit inside the acceptance
+    band without physical presence.
+    """
+
+    x: float
+    y: float
+    width: float
+    height: float
+
+    def contains(self, px: float, py: float) -> bool:
+        return (
+            self.x <= px <= self.x + self.width
+            and self.y <= py <= self.y + self.height
+        )
+
+    def contains_all(self, positions: List[Tuple[float, float]]) -> bool:
+        """Return True only if every position sample falls within the boundary."""
+        return all(self.contains(px, py) for px, py in positions)
+
+
+class _NonceStore:
+    """
+    TTL-keyed, FIFO-evicting nonce rejection store.
+
+    Fixes two bugs in the original ``set``-based store:
+      1. ``set.pop()`` removes an *arbitrary* element — recently-used nonces
+         could be silently evicted and then replayed.
+      2. In-process state evaporates on restart; the TTL window makes a
+         single-process deployment safe within the configured window.
+
+    For multi-replica deployments replace this with a Redis TTL-keyed store.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = 60.0,
+        max_size: int = 10_000,
+    ) -> None:
+        self._store: OrderedDict[str, float] = OrderedDict()
+        self._ttl = ttl_seconds
+        self._max_size = max_size
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def is_seen(self, nonce: str) -> bool:
+        """Return True if the nonce is within the active replay-rejection window."""
+        self._evict_expired()
+        return nonce in self._store
+
+    def add(self, nonce: str) -> None:
+        """Record a nonce as consumed."""
+        self._evict_expired()
+        if nonce in self._store:
+            return  # already recorded, idempotent
+        if len(self._store) >= self._max_size:
+            self._store.popitem(last=False)  # evict oldest by insertion order
+        self._store[nonce] = time.time()
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _evict_expired(self) -> None:
+        """Remove nonces older than the TTL window from the front of the store."""
+        cutoff = time.time() - self._ttl
+        while self._store:
+            _, ts = next(iter(self._store.items()))
+            if ts < cutoff:
+                self._store.popitem(last=False)
+            else:
+                break
+
+
+# ---------------------------------------------------------------------------
 # Cascade engine
 # ---------------------------------------------------------------------------
+
 
 class CascadeMLKEM:
     """
@@ -141,6 +231,7 @@ class CascadeMLKEM:
         quorum_validator: Optional[QuorumValidator] = None,
         allowed_roles: Optional[Set[str]] = None,
         min_samples: int = 6,
+        boundary: Optional[SpatialBoundary] = None,
     ) -> None:
         self._siem = siem or SIEMLogger()
         self._detector = EntropyAnomalyDetector(entropy_thresholds)
@@ -149,10 +240,11 @@ class CascadeMLKEM:
         self._quorum = quorum_validator or QuorumValidator()
         self._allowed_roles = allowed_roles or {"operator", "admin"}
         self._min_samples = min_samples
+        self._boundary = boundary
 
-        # Used nonces — prevents session replay
-        self._used_nonces: Set[str] = set()
-        self._max_nonce_history = 10_000
+        # TTL-keyed nonce store — prevents replay within the active window.
+        # For multi-replica deployments replace with a Redis-backed store.
+        self._nonce_store = _NonceStore()
 
         # Generate three independent keypairs for the cascade layers
         self._keypairs = [SimulatedMLKEMKeypair.generate() for _ in range(3)]
@@ -240,6 +332,28 @@ class CascadeMLKEM:
         shared_secrets.append(ss1)
 
         # ------------------------------------------------------------------
+        # Layer 1.5 — Server-side spatial boundary gate
+        # The perimeter is defined only in server config — never sent to
+        # clients, preventing coordinate-crafting attacks.
+        # ------------------------------------------------------------------
+        if self._boundary is not None and not self._boundary.contains_all(positions):
+            self._siem.emit(
+                EventType.POSITION_REJECTED,
+                f"Cascade {cascade_id} collapsed: positions outside server perimeter",
+                {"cascade_id": cascade_id},
+                source_ip=source_ip,
+            )
+            return CascadeResult(
+                success=False,
+                decrypt_key=None,
+                failure_reason=CascadeFailureReason.OUTSIDE_PERIMETER,
+                entropy_result=entropy_result,
+                quorum_details=None,
+                layer_reached=1,
+                cascade_id=cascade_id,
+            )
+
+        # ------------------------------------------------------------------
         # Layer 2 — Velocity + session nonce gate
         # ------------------------------------------------------------------
         if entropy_result.velocity_max > (
@@ -264,7 +378,7 @@ class CascadeMLKEM:
                 cascade_id=cascade_id,
             )
 
-        if session_nonce in self._used_nonces:
+        if self._nonce_store.is_seen(session_nonce):
             self._siem.emit(
                 EventType.REPLAY_DETECTED,
                 f"Cascade {cascade_id} collapsed at Layer 2: nonce reuse",
@@ -282,14 +396,8 @@ class CascadeMLKEM:
                 cascade_id=cascade_id,
             )
 
-        # Record nonce
-        self._used_nonces.add(session_nonce)
-        if len(self._used_nonces) > self._max_nonce_history:
-            # Evict oldest (set has no order — in production use an
-            # ordered structure; acceptable for prototype).
-            excess = len(self._used_nonces) - self._max_nonce_history
-            for _ in range(excess):
-                self._used_nonces.pop()
+        # Record nonce in the TTL-keyed FIFO store (evicts oldest by insertion order)
+        self._nonce_store.add(session_nonce)
 
         # Layer 2 passed — encapsulate (requires ss1 for chaining)
         chain_input = ss1 + session_nonce.encode()

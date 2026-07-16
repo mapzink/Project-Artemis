@@ -7,7 +7,10 @@ import { Toaster, toast } from "sonner";
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
-const concealedSecureZone = { x: 49.2, y: 47.4, width: 2.7, height: 5.0 };
+// DISPLAY_ZONE is used ONLY for rendering the visual boundary on the grid.
+// The real security perimeter is enforced server-side via _SECURE_BOUNDARY
+// (env-configurable) and is never exposed to this client bundle.
+const DISPLAY_ZONE = { x: 49.2, y: 47.4, width: 2.7, height: 5.0 };
 const initialLogLines = [
   "[GEMINI-FLASH // SYSTEM] Secure quantum proximity vault active.",
   "[GEMINI-FLASH // INTEL] Ready for physical boundary attestation.",
@@ -93,10 +96,10 @@ function SimulationWidget() {
 
   const concealedZoneState = useMemo(() => {
     return (
-      node.x >= concealedSecureZone.x &&
-      node.x <= concealedSecureZone.x + concealedSecureZone.width &&
-      node.y >= concealedSecureZone.y &&
-      node.y <= concealedSecureZone.y + concealedSecureZone.height
+      node.x >= DISPLAY_ZONE.x &&
+      node.x <= DISPLAY_ZONE.x + DISPLAY_ZONE.width &&
+      node.y >= DISPLAY_ZONE.y &&
+      node.y <= DISPLAY_ZONE.y + DISPLAY_ZONE.height
     );
   }, [node]);
 
@@ -187,10 +190,10 @@ function SimulationWidget() {
 
       const isNearBorder = node.x < 20 || node.x > 80 || node.y < 20 || node.y > 80;
       const insideSecure =
-        node.x >= concealedSecureZone.x &&
-        node.x <= concealedSecureZone.x + concealedSecureZone.width &&
-        node.y >= concealedSecureZone.y &&
-        node.y <= concealedSecureZone.y + concealedSecureZone.height;
+        node.x >= DISPLAY_ZONE.x &&
+        node.x <= DISPLAY_ZONE.x + DISPLAY_ZONE.width &&
+        node.y >= DISPLAY_ZONE.y &&
+        node.y <= DISPLAY_ZONE.y + DISPLAY_ZONE.height;
 
       let log = "";
       if (insideSecure) {

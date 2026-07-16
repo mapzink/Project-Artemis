@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Security
+from fastapi import FastAPI, APIRouter, HTTPException, Query, Request, Security
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import resend
 
 from backend.security.chunks import ChunkAttestor, QuorumValidator
-from backend.security.cascade import CascadeMLKEM
+from backend.security.cascade import CascadeMLKEM, SpatialBoundary
 from backend.security.siem import SIEMLogger, EventType
 from backend.security.uwb_proxy import UWBProxyClient
 
@@ -43,9 +43,16 @@ _admin_key_header = APIKeyHeader(name="X-Artemis-Admin-Key", auto_error=False)
 _ADMIN_KEY: str = os.environ.get("ARTEMIS_ADMIN_KEY") or secrets.token_hex(32)
 if not os.environ.get("ARTEMIS_ADMIN_KEY"):
     logging.getLogger(__name__).warning(
-        "ARTEMIS_ADMIN_KEY not set — generated ephemeral key for this session: %s",
-        _ADMIN_KEY,
+        "ARTEMIS_ADMIN_KEY not set — using ephemeral key for this session. "
+        "Set ARTEMIS_ADMIN_KEY in the environment for production deployments."
+        # NOTE: the key value is intentionally NOT logged — logging it would
+        # expose it to anyone with log access (Finding F2).
     )
+    if os.environ.get("ENV", "").lower() == "production":
+        raise RuntimeError(
+            "ARTEMIS_ADMIN_KEY must be explicitly set in production. "
+            "Generate with: openssl rand -hex 32"
+        )
 
 
 async def _require_admin_key(api_key: Optional[str] = Security(_admin_key_header)) -> str:
@@ -56,6 +63,33 @@ async def _require_admin_key(api_key: Optional[str] = Security(_admin_key_header
             detail="Forbidden: valid X-Artemis-Admin-Key required",
         )
     return api_key
+
+
+# ---------------------------------------------------------------------------
+# Server-side perimeter — NEVER exposed to clients.
+# Loaded from env vars so the exact coordinates can be rotated without redeploy.
+# ---------------------------------------------------------------------------
+_SECURE_BOUNDARY = SpatialBoundary(
+    x=float(os.environ.get("SECURE_ZONE_X", "49.2")),
+    y=float(os.environ.get("SECURE_ZONE_Y", "47.4")),
+    width=float(os.environ.get("SECURE_ZONE_W", "2.7")),
+    height=float(os.environ.get("SECURE_ZONE_H", "5.0")),
+)
+
+
+def _derive_role(api_key: Optional[str]) -> str:
+    """
+    Derive user role from server-side context only.
+
+    Role is NOT accepted from the request body — allowing callers to
+    self-assign roles is an authentication bypass (CWE-287, Finding F1).
+
+    - Admin key present and valid → ``"admin"``
+    - All other callers             → ``"operator"``
+    """
+    if api_key and secrets.compare_digest(api_key, _ADMIN_KEY):
+        return "admin"
+    return "operator"
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -73,6 +107,7 @@ cascade = CascadeMLKEM(
     siem=siem_logger,
     chunk_attestor=chunk_attestor,
     quorum_validator=quorum_validator,
+    boundary=_SECURE_BOUNDARY,
 )
 uwb_proxy = UWBProxyClient()
 
@@ -128,7 +163,9 @@ class DecryptRequest(BaseModel):
     """Request body for /api/decrypt — full CEG-KEM cascade."""
     positions: List[PositionSample] = Field(..., min_length=6)
     session_nonce: str = Field(..., min_length=8, max_length=128)
-    user_role: str = Field(..., min_length=1, max_length=64)
+    # user_role is intentionally absent — role is derived server-side from
+    # authenticated context (admin key header) and must never be trusted from
+    # the request body. See _derive_role().
 
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
@@ -262,9 +299,13 @@ async def verify_position(body: VerifyPositionRequest, request: Request):
 
 
 @api_router.post("/decrypt")
-async def decrypt_vault(body: DecryptRequest, request: Request):
+async def decrypt_vault(
+    body: DecryptRequest,
+    request: Request,
+    api_key: Optional[str] = Security(_admin_key_header),
+):
     """
-    Full CEG-KEM cascade — entropy + velocity + nonce + role gates.
+    Full CEG-KEM cascade — entropy + velocity + nonce + role + quorum gates.
 
     On success, returns the hex-encoded decrypt key.
     On failure, returns the layer at which the cascade collapsed and why.
@@ -273,11 +314,21 @@ async def decrypt_vault(body: DecryptRequest, request: Request):
     timestamps = [s.t for s in body.positions]
     source_ip = request.client.host if request.client else None
 
+    # Role derived from server-side context — never from the request body.
+    derived_role = _derive_role(api_key)
+
+    # Generate chunk attestations server-side so the quorum gate (Layer 3)
+    # is active. All samples included; the spatial boundary gate inside the
+    # cascade will reject any that fall outside the server-defined perimeter.
+    valid_flags = [True] * len(positions)
+    chunks = chunk_attestor.create_chunks(positions, timestamps, valid_flags)
+
     result = cascade.execute(
         positions=positions,
         timestamps=timestamps,
         session_nonce=body.session_nonce,
-        user_role=body.user_role,
+        user_role=derived_role,
+        chunks=chunks,
         source_ip=source_ip,
     )
 
@@ -313,7 +364,7 @@ async def decrypt_vault(body: DecryptRequest, request: Request):
 
 @api_router.get("/security/events")
 async def get_security_events(
-    count: int = 50,
+    count: int = Query(default=50, ge=1, le=500),
     severity: Optional[str] = None,
     _key: str = Security(_require_admin_key),
 ):
